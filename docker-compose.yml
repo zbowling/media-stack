@@ -1,0 +1,831 @@
+name: media-stack
+
+x-common-env: &common-env
+  PUID: ${PUID}
+  PGID: ${PGID}
+  TZ: ${TIMEZONE}
+
+x-localtime-volume: &localtime-volume /etc/localtime:/etc/localtime:ro
+
+x-mynetwork: &mynetwork
+  networks:
+    - mynetwork
+
+services:
+  # Traefik - Reverse proxy and SSL termination
+  # Handles routing for all services and manages SSL certificates via Let's Encrypt and Tailscale
+  traefik:
+    image: ghcr.io/traefik/traefik:${TRAEFIK_VERSION}
+    container_name: traefik
+    restart: always
+    environment:
+      - CLOUDFLARE_EMAIL=${CLOUDFLARE_EMAIL}
+      - CF_API_EMAIL=${CLOUDFLARE_EMAIL}
+      - CF_DNS_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - LETS_ENCRYPT_EMAIL=${LETS_ENCRYPT_EMAIL}
+    command:
+      - --ping=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web-secure.address=:443
+      - --entrypoints.web.http.redirections.entryPoint.to=web-secure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+      - --experimental.plugins.rewrite-body.modulename=github.com/packruler/rewrite-body
+      - --experimental.plugins.rewrite-body.version=v1.2.0
+      - --experimental.plugins.rewriteHeaders.modulename=github.com/XciD/traefik-plugin-rewrite-headers
+      - --experimental.plugins.rewriteHeaders.version=v0.0.3
+      - --certificatesresolvers.${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}.tailscale=true
+      - --certificatesResolvers.${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}.acme.dnsChallenge=true
+      - --certificatesResolvers.${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}.acme.dnsChallenge.provider=cloudflare
+      - --certificatesresolvers.${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}.acme.caserver=https://acme-v02.api.letsencrypt.org/directory
+      - --certificatesResolvers.${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}.acme.email=${CLOUDFLARE_EMAIL}
+      - --certificatesResolvers.${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}.acme.storage=/etc/traefik/acme/acme.json
+      - --log.level=DEBUG
+    ports:
+      - "${TRAEFIK_HTTP_PORT}:80"
+      - "${TRAEFIK_HTTPS_PORT}:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+      - ${CONFIG_ROOT:-.}/traefik/acme:/etc/traefik/acme
+    extra_hosts:
+      - host.docker.internal:172.17.0.1
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      retries: 10
+    <<: *mynetwork
+
+  
+  # Whoami - Simple HTTP service for testing Traefik routing
+  whoami:
+    image: docker.io/traefik/whoami:${WHOAMI_VERSION}
+    container_name: "whoami"
+    <<: *mynetwork
+    ports:
+      - "${WHOAMI_PORT}:${WHOAMI_PORT}"
+    command:
+       # It tells whoami to start listening on 2001 instead of 80
+       - --port=${WHOAMI_PORT}
+       - --name=${PUBLIC_HOSTNAME}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.whoami.rule=Host(`${PUBLIC_HOSTNAME}`)"
+      - "traefik.http.routers.whoami.entrypoints=web-secure"
+      - "traefik.http.routers.whoami.tls.certresolver=${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}"
+      - "traefik.http.services.whoami.loadbalancer.server.port=${WHOAMI_PORT}"
+
+  # Homepage - Dashboard for all services
+  # Provides a unified interface to access all media services
+  homepage:
+    image: ghcr.io/gethomepage/homepage:${HOMEPAGE_VERSION}
+    container_name: ${HOMEPAGE_SERVICE_NAME}
+    <<: *mynetwork
+    environment:
+      HOMEPAGE_VAR_TITLE: ${HOMEPAGE_VAR_TITLE}
+      HOMEPAGE_VAR_SEARCH_PROVIDER: ${HOMEPAGE_VAR_SEARCH_PROVIDER}
+      HOMEPAGE_VAR_HEADER_STYLE: ${HOMEPAGE_VAR_HEADER_STYLE}
+      HOMEPAGE_VAR_WEATHER_CITY: ${HOMEPAGE_VAR_WEATHER_CITY}
+      HOMEPAGE_VAR_WEATHER_LAT: ${HOMEPAGE_VAR_WEATHER_LAT}
+      HOMEPAGE_VAR_WEATHER_LONG: ${HOMEPAGE_VAR_WEATHER_LONG}
+      HOMEPAGE_VAR_WEATHER_TIME: ${TIMEZONE}
+      HOMEPAGE_VAR_WEATHER_UNIT: ${HOMEPAGE_VAR_WEATHER_UNIT}
+      HOMEPAGE_ALLOWED_HOSTS: ${HOSTNAME}
+    ports:
+      - ${HOMEPAGE_PORT}:${HOMEPAGE_PORT}
+    volumes:
+      - ${CONFIG_ROOT:-.}/homepage:/app/config
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - ${DATA_ROOT}:/data
+    restart: always
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${HOMEPAGE_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${HOMEPAGE_PATH_PREFIX}`))"
+      - "traefik.http.routers.${HOMEPAGE_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${HOMEPAGE_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${HOMEPAGE_SERVICE_NAME}.loadbalancer.server.port=${HOMEPAGE_PORT}"
+
+  # qBittorrent - BitTorrent client
+  # Downloads torrents for movies, TV shows, and music
+  ## Default credentials of qBittorrent - Username: admin password: adminadmin ##
+  ## Change password after install from UI --> Tools --> Options --> WebUI ##
+  qbittorrent:
+    container_name: ${QBITTORRENT_SERVICE_NAME}
+    image: lscr.io/linuxserver/qbittorrent:${QBITTORRENT_VERSION}
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+      WEBUI_PORT: ${QBITTORRENT_PORT}
+    volumes:
+      - ${CONFIG_ROOT:-.}/qbittorrent-config:/config
+      - ${DATA_ROOT}/torrents:/data/torrents
+    ports:
+      - ${QBITTORRENT_PORT}:${QBITTORRENT_PORT}
+      - ${QBITTORRENT_TORRENT_PORT}:${QBITTORRENT_TORRENT_PORT}
+      - ${QBITTORRENT_TORRENT_PORT_UDP}:${QBITTORRENT_TORRENT_PORT_UDP}/udp
+      - ${QBITTORRENT_ADDITIONAL_PORT}:${QBITTORRENT_ADDITIONAL_PORT}
+      - ${QBITTORRENT_ADDITIONAL_PORT_UDP}:${QBITTORRENT_ADDITIONAL_PORT_UDP}/udp
+    restart: "unless-stopped"
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${QBITTORRENT_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${QBITTORRENT_PATH_PREFIX}`))"
+      - "traefik.http.routers.${QBITTORRENT_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${QBITTORRENT_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${QBITTORRENT_SERVICE_NAME}.loadbalancer.server.port=${QBITTORRENT_PORT}"
+      - "traefik.http.routers.${QBITTORRENT_SERVICE_NAME}.middlewares=qbittorrent-strip-slash,qbittorrent-stripprefix"
+      - "traefik.http.middlewares.qbittorrent-stripprefix.stripPrefix.prefixes=${QBITTORRENT_PATH_PREFIX}"
+      - "traefik.http.middlewares.qbittorrent-strip-slash.redirectregex.regex=(^.*${QBITTORRENT_PATH_PREFIX}$$)"
+      - "traefik.http.middlewares.qbittorrent-strip-slash.redirectregex.replacement=$$1/"
+      - "traefik.http.middlewares.qbittorrent-strip-slash.redirectregex.permanent=false"
+      - "homepage.group=${QBITTORRENT_HOMEPAGE_GROUP}"
+      - "homepage.name=${QBITTORRENT_HOMEPAGE_NAME}"
+      - "homepage.icon=${QBITTORRENT_HOMEPAGE_ICON}"
+      - "homepage.href=${QBITTORRENT_PATH_PREFIX}"
+      - "homepage.description=${QBITTORRENT_HOMEPAGE_DESCRIPTION}"
+      - "homepage.widget.type=${QBITTORRENT_HOMEPAGE_WIDGET_TYPE}"
+      - "homepage.widget.url=${QBITTORRENT_HOMEPAGE_WIDGET_URL}"
+      - "homepage.widget.username=${QBITTORRENT_USERNAME}"
+      - "homepage.widget.password=${QBITTORRENT_PASSWORD}"
+      - "homepage.widget.enableLeechProgress=true"
+
+  # Radarr - Movie collection manager
+  # Monitors for new movies, handles downloads, and organizes your movie library
+  radarr:
+    container_name: ${RADARR_SERVICE_NAME}
+    image: lscr.io/linuxserver/radarr:${RADARR_VERSION}
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+    ports:
+      - ${RADARR_PORT}:${RADARR_PORT}
+    volumes:
+      - *localtime-volume
+      - ${DATA_ROOT}:/data
+      - ${CONFIG_ROOT:-.}/radarr-config:/config
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:${RADARR_PORT}/radarr/ping"]
+      interval: 30s
+      retries: 10
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${RADARR_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${RADARR_PATH_PREFIX}`))"
+      - "traefik.http.routers.${RADARR_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${RADARR_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${RADARR_SERVICE_NAME}.loadbalancer.server.port=${RADARR_PORT}"
+      - "homepage.group=${RADARR_HOMEPAGE_GROUP}"
+      - "homepage.name=${RADARR_HOMEPAGE_NAME}"
+      - "homepage.icon=${RADARR_HOMEPAGE_ICON}"
+      - "homepage.href=${RADARR_PATH_PREFIX}"
+      - "homepage.description=${RADARR_HOMEPAGE_DESCRIPTION}"
+      - "homepage.widget.type=${RADARR_HOMEPAGE_WIDGET_TYPE}"
+      - "homepage.widget.url=${RADARR_HOMEPAGE_WIDGET_URL}"
+      - "homepage.widget.key=${RADARR_API_KEY}"
+      - "homepage.widget.enableQueue=true"
+  
+  # Sonarr - TV series collection manager
+  # Monitors for new episodes, handles downloads, and organizes your TV library
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:${SONARR_VERSION}
+    container_name: ${SONARR_SERVICE_NAME}
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+    volumes:
+      - *localtime-volume
+      - ${CONFIG_ROOT:-.}/sonarr-config:/config
+      - ${DATA_ROOT}:/data
+    ports:
+      - ${SONARR_PORT}:${SONARR_PORT}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:${SONARR_PORT}/sonarr/ping"]
+      interval: 30s
+      retries: 10
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${SONARR_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${SONARR_PATH_PREFIX}`))"
+      - "traefik.http.routers.${SONARR_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${SONARR_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${SONARR_SERVICE_NAME}.loadbalancer.server.port=${SONARR_PORT}"
+      - "homepage.group=${SONARR_HOMEPAGE_GROUP}"
+      - "homepage.name=${SONARR_HOMEPAGE_NAME}"
+      - "homepage.icon=${SONARR_HOMEPAGE_ICON}"
+      - "homepage.href=${SONARR_PATH_PREFIX}"
+      - "homepage.description=${SONARR_HOMEPAGE_DESCRIPTION}"
+      - "homepage.widget.type=${SONARR_HOMEPAGE_WIDGET_TYPE}"
+      - "homepage.widget.url=${SONARR_HOMEPAGE_WIDGET_URL}"
+      - "homepage.widget.key=${SONARR_API_KEY}"
+      - "homepage.widget.enableQueue=true"
+  
+  # Lidarr - Music collection manager
+  # Monitors for new music releases, handles downloads, and organizes your music library
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:${LIDARR_VERSION}
+    container_name: ${LIDARR_SERVICE_NAME}
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+    volumes:
+      - *localtime-volume
+      - ${CONFIG_ROOT:-.}/lidarr:/config
+      - ${DATA_ROOT}:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:${LIDARR_PORT}/lidarr/ping"]
+      interval: 30s
+      retries: 10
+    ports:
+      - ${LIDARR_PORT}:${LIDARR_PORT}
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${LIDARR_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${LIDARR_PATH_PREFIX}`))"
+      - "traefik.http.routers.${LIDARR_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${LIDARR_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${LIDARR_SERVICE_NAME}.loadbalancer.server.port=${LIDARR_PORT}"
+      - "homepage.group=${LIDARR_HOMEPAGE_GROUP}"
+      - "homepage.name=${LIDARR_HOMEPAGE_NAME}"
+      - "homepage.icon=${LIDARR_HOMEPAGE_ICON}"
+      - "homepage.href=${LIDARR_PATH_PREFIX}"
+      - "homepage.description=${LIDARR_HOMEPAGE_DESCRIPTION}"
+      - "homepage.widget.type=${LIDARR_HOMEPAGE_WIDGET_TYPE}"
+      - "homepage.widget.url=${LIDARR_HOMEPAGE_WIDGET_URL}"
+      - "homepage.widget.key=${LIDARR_API_KEY}"
+
+  # Prowlarr - Indexer manager
+  # Manages torrent indexers and integrates with Sonarr, Radarr, and Lidarr
+  prowlarr:
+    container_name: ${PROWLARR_SERVICE_NAME}
+    image: lscr.io/linuxserver/prowlarr:${PROWLARR_VERSION}
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+    volumes:
+      - *localtime-volume
+      - ${CONFIG_ROOT:-.}/prowlarr-config:/config
+    ports:
+      - ${PROWLARR_PORT}:${PROWLARR_PORT}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:${PROWLARR_PORT}/prowlarr/ping"]
+      interval: 30s
+      retries: 10
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${PROWLARR_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${PROWLARR_PATH_PREFIX}`))"
+      - "traefik.http.routers.${PROWLARR_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${PROWLARR_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${PROWLARR_SERVICE_NAME}.loadbalancer.server.port=${PROWLARR_PORT}"
+      - "homepage.group=${PROWLARR_HOMEPAGE_GROUP}"
+      - "homepage.name=${PROWLARR_HOMEPAGE_NAME}"
+      - "homepage.icon=${PROWLARR_HOMEPAGE_ICON}"
+      - "homepage.href=${PROWLARR_PATH_PREFIX}"
+      - "homepage.description=${PROWLARR_HOMEPAGE_DESCRIPTION}"
+      - "homepage.widget.type=${PROWLARR_HOMEPAGE_WIDGET_TYPE}"
+      - "homepage.widget.url=${PROWLARR_HOMEPAGE_WIDGET_URL}"
+      - "homepage.widget.key=${PROWLARR_API_KEY}"
+
+  # Jellyseerr - Media request management
+  # Allows users to request movies and TV shows, integrates with Jellyfin
+  jellyseerr:
+    image: docker.io/fallenbagel/jellyseerr:${JELLYSEERR_VERSION}
+    container_name: ${JELLYSEERR_SERVICE_NAME}
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+    volumes:
+      - *localtime-volume
+      - ${CONFIG_ROOT:-.}/jellyseerr:/app/config
+    ports:
+      - ${JELLYSEERR_PORT}:${JELLYSEERR_PORT}
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "http://127.0.0.1:${JELLYSEERR_PORT}/api/v1/status",
+          "-qO",
+          "/dev/null",
+        ]
+      interval: 30s
+      retries: 10
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${JELLYSEERR_SERVICE_NAME}.rule=Host(`${JELLYSEERR_HOSTNAME}`)"
+      - "traefik.http.routers.${JELLYSEERR_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${JELLYSEERR_SERVICE_NAME}.entrypoints=web-secure"
+      - "traefik.http.routers.${JELLYSEERR_SERVICE_NAME}.tls.domains[0].main=${PUBLIC_HOSTNAME}"
+      - "traefik.http.routers.${JELLYSEERR_SERVICE_NAME}.tls.domains[0].sans=*.${PUBLIC_HOSTNAME}"
+      - "traefik.http.routers.${JELLYSEERR_SERVICE_NAME}.tls.certresolver=${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${JELLYSEERR_SERVICE_NAME}.loadbalancer.server.port=${JELLYSEERR_PORT}"
+      - "homepage.group=${JELLYSEERR_HOMEPAGE_GROUP}"
+      - "homepage.name=${JELLYSEERR_HOMEPAGE_NAME}"
+      - "homepage.icon=${JELLYSEERR_HOMEPAGE_ICON}"
+      - "homepage.href=https://${JELLYSEERR_HOSTNAME}/"
+      - "homepage.description=${JELLYSEERR_HOMEPAGE_DESCRIPTION}"
+      - "homepage.widget.type=${JELLYSEERR_HOMEPAGE_WIDGET_TYPE}"
+      - "homepage.widget.url=${JELLYSEERR_HOMEPAGE_WIDGET_URL}"
+      - "homepage.widget.key=${JELLYSEERR_API_KEY}"
+
+  # Jellyfin - Open source media server
+  # Streams movies, TV shows, and music to various devices
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:${JELLYFIN_VERSION}
+    container_name: ${JELLYFIN_SERVICE_NAME}
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+    runtime: nvidia
+    volumes:
+      - *localtime-volume
+      - ${CONFIG_ROOT:-.}/jellyfin-config:/config
+      - ${DATA_ROOT}/media:/data/media
+    devices:
+      - /dev/dri:/dev/dri
+    ports:
+      - ${JELLYFIN_PORT}:${JELLYFIN_PORT}
+      - ${JELLYFIN_DLNA_PORT}:${JELLYFIN_DLNA_PORT}/udp
+      - ${JELLYFIN_HTTPS_PORT}:${JELLYFIN_HTTPS_PORT}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:${JELLYFIN_PORT}/jellyfin/health"]
+      interval: 30s
+      retries: 10
+    labels:
+      - traefik.enable=true
+      # Internal
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${JELLYFIN_PATH_PREFIX}`))"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}.entrypoints=web-secure"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}.service=${JELLYFIN_SERVICE_NAME}"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${JELLYFIN_SERVICE_NAME}.loadbalancer.server.port=${JELLYFIN_PORT}"
+
+      # Public
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}-public.rule=Host(`${JELLYFIN_SERVICE_NAME}.${PUBLIC_HOSTNAME}`)"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}-public.entrypoints=web-secure"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}-public.tls=true"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}-public.service=${JELLYFIN_SERVICE_NAME}-public"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}-public.tls.domains[0].main=${PUBLIC_HOSTNAME}"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}-public.tls.domains[0].sans=*.${PUBLIC_HOSTNAME}"
+      - "traefik.http.routers.${JELLYFIN_SERVICE_NAME}-public.tls.certresolver=${TRAEFIK_LETSENCRYPT_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${JELLYFIN_SERVICE_NAME}-public.loadbalancer.server.port=${JELLYFIN_PORT}"
+      
+      - "homepage.group=${JELLYFIN_HOMEPAGE_GROUP}"
+      - "homepage.name=${JELLYFIN_HOMEPAGE_NAME}"
+      - "homepage.icon=${JELLYFIN_HOMEPAGE_ICON}"
+      - "homepage.href=${JELLYFIN_PATH_PREFIX}"
+      - "homepage.description=${JELLYFIN_HOMEPAGE_DESCRIPTION}"
+      - "homepage.widget.type=${JELLYFIN_HOMEPAGE_WIDGET_TYPE}"
+      - "homepage.widget.url=${JELLYFIN_HOMEPAGE_WIDGET_URL}"
+      - "homepage.widget.key=${JELLYFIN_API_KEY}"
+      - "homepage.widget.enableBlocks=true"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+  
+  # Plex - Media server (alternative to Jellyfin)
+  # Commercial media server with wide device support
+  plex:
+    image: docker.io/plexinc/pms-docker:${PLEX_VERSION}
+    container_name: plex
+    network_mode: host
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      PUID: ${PUID}
+      PGID: ${PGID}
+      PLEX_CLAIM: ${PLEX_CLAIM}
+      VERSION: docker
+      PLEX_UID: ${PUID}
+      PLEX_GID: ${PGID}
+      TZ: ${TIMEZONE}
+      ALLOWED_NETWORKS: ${PLEX_ALLOWED_NETWORKS}
+    volumes:
+      - *localtime-volume
+      - ${DATA_ROOT}:/data
+      - ${CONFIG_ROOT:-.}/plex-config:/config
+    restart: unless-stopped
+
+  # Doc: https://github.com/navilg/cleanmyarr
+  # cleanmyarr:
+  #   profiles: ["vpn", "no-vpn"]
+  #   depends_on:
+  #     - radarr
+  #     - sonarr
+  #   image: linuxshots/cleanmyarr:0.8.1
+  #   container_name: cleanmyarr
+  #   networks:
+  #     - mynetwork
+  #   volumes:
+  #     - cleanmyarr-config:/config
+    # restart: unless-stopped
+    # environment:
+    # - CMA_MAINTENANCE_CYCLE=${CMA_MAINTENANCE_CYCLE:-""}
+    # - CMA_DELETE_AFTER_DAYS=${CMA_DELETE_AFTER_DAYS:-""}
+    # - CMA_ENABLE_EMAIL_NOTIFICATION=${CMA_ENABLE_EMAIL_NOTIFICATION:-""}
+    # - CMA_SMTP_USERNAME=${CMA_SMTP_USERNAME:-""}
+    # - CMA_SMTP_ENCODED_PASSWORD=${CMA_SMTP_ENCODED_PASSWORD:-""}
+    # - CMA_SMTP_TO_EMAILS=${CMA_SMTP_TO_EMAILS:-""}
+    # - CMA_ENABLE_GOTIFY_NOTIFICATION=${CMA_ENABLE_GOTIFY_NOTIFICATION:-""}
+    # - CMA_GOTIFY_URL=${CMA_GOTIFY_URL:-""}
+    # - CMA_GOTIFY_ENCODED_APP_TOKEN=${CMA_GOTIFY_ENCODED_APP_TOKEN:-""}
+    # - CMA_ENABLE_TELEGRAM_NOTIFICATION=${CMA_ENABLE_TELEGRAM_NOTIFICATION:-""}
+    # - CMA_TELEGRAM_ENCODED_BOT_TOKEN=${CMA_TELEGRAM_ENCODED_BOT_TOKEN:-""}
+    # - CMA_TELEGRAM_CHAT_ID=${CMA_TELEGRAM_CHAT_ID:-""}
+    # - CMA_MONITOR_RADARR=${CMA_MONITOR_RADARR:-""}
+    # - CMA_RADARR_URL=${CMA_RADARR_URL:-""}
+    # - CMA_RADARR_ENCODED_API_KEY=${CMA_RADARR_ENCODED_API_KEY:-""}
+    # - CMA_RADARR_ENABLE_NOTIFICATION=${CMA_RADARR_ENABLE_NOTIFICATION:-""}
+
+  # Unpackerr - Automatic archive extraction
+  # Monitors download folders and automatically extracts archives for media processing
+  unpackerr:
+    image: docker.io/golift/unpackerr:${UNPACKERR_VERSION}
+    container_name: unpackerr
+    restart: unless-stopped
+    user: 1000:1000
+    <<: *mynetwork
+    volumes:
+      - ${DATA_ROOT}:/data
+    environment:
+      <<: *common-env
+      # Documentation on all Environment Variables can be found at:
+      # https://github.com/davidnewhall/unpackerr#docker-env-variables
+      UN_DEBUG: false
+      UN_LOG_FILE:
+      UN_LOG_FILES: 10
+      UN_LOG_FILE_MB: 10
+      UN_INTERVAL: 2m
+      UN_START_DELAY: 1m
+      UN_RETRY_DELAY: 5m
+      UN_MAX_RETRIES: 3
+      UN_PARALLEL: 10
+      UN_FILE_MODE: "0664"
+      UN_DIR_MODE: "0775"
+      UN_FOLDER_0_PATH: /data/torrents
+      # Sonarr Config - Copy API Key from: http://sonarr:8989/general/settings
+      UN_SONARR_0_URL: http://${SONARR_SERVICE_NAME}:${SONARR_PORT}${SONARR_PATH_PREFIX}
+      UN_SONARR_0_API_KEY: ${SONARR_API_KEY}
+      UN_SONARR_0_PATHS_0: /data/torrents/tv
+      UN_SONARR_0_PATHS_1: /data/torrents/tv-sonarr
+      UN_SONARR_0_PATHS_2: /data/torrents/sonarr
+      UN_SONARR_0_PROTOCOLS: torrent
+      UN_SONARR_0_TIMEOUT: 10s
+      UN_SONARR_0_DELETE_ORIG: false
+      UN_SONARR_0_DELETE_DELAY: 5m
+      # Radarr Config - Copy API Key from: http://radarr:7878/general/settings
+      UN_RADARR_0_URL: http://${RADARR_SERVICE_NAME}:${RADARR_PORT}${RADARR_PATH_PREFIX}
+      UN_RADARR_0_API_KEY: ${RADARR_API_KEY}
+      UN_RADARR_0_PATHS_0: /data/torrents/movies
+      UN_RADARR_0_PATHS_1: /data/torrents/radarr
+      UN_RADARR_0_PROTOCOLS: torrent
+      UN_RADARR_0_TIMEOUT: 10s
+      UN_RADARR_0_DELETE_ORIG: false
+      UN_RADARR_0_DELETE_DELAY: 5m
+      # Lidarr Config - Copy API Key from: http://lidarr:8686/general/settings
+      UN_LIDARR_0_URL: http://${LIDARR_SERVICE_NAME}:${LIDARR_PORT}${LIDARR_PATH_PREFIX}
+      UN_LIDARR_0_API_KEY: ${LIDARR_API_KEY}
+      UN_LIDARR_0_PATHS_0: /data/torrents/music
+      UN_LIDARR_0_PATHS_1: /data/torrents/lidarr
+      UN_LIDARR_0_PROTOCOLS: torrent
+      UN_LIDARR_0_TIMEOUT: 10s
+      UN_LIDARR_0_DELETE_ORIG: false
+      UN_LIDARR_0_DELETE_DELAY: 5m
+
+  # Huntarr - Media management tool
+  # Helps manage and organize media files
+  huntarr:
+    image: docker.io/huntarr/huntarr:${HUNTARR_VERSION}
+    container_name: huntarr
+    <<: *mynetwork
+    environment:
+      <<: *common-env
+    volumes:
+      - *localtime-volume
+      - ${CONFIG_ROOT:-.}/huntarr:/config
+      - ${DATA_ROOT}:/data
+    ports:
+      - ${HUNTARR_PORT}:${HUNTARR_PORT}
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.${HUNTARR_SERVICE_NAME}.rule=(Host(`${HOSTNAME}`) && PathPrefix(`${HUNTARR_PATH_PREFIX}`))"
+      - "traefik.http.routers.${HUNTARR_SERVICE_NAME}.tls=true"
+      - "traefik.http.routers.${HUNTARR_SERVICE_NAME}.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.${HUNTARR_SERVICE_NAME}.loadbalancer.server.port=${HUNTARR_PORT}"
+      - "traefik.http.routers.${HUNTARR_SERVICE_NAME}.middlewares=${HUNTARR_SERVICE_NAME}-strip-slash,${HUNTARR_SERVICE_NAME}-stripprefix"
+      - "traefik.http.middlewares.${HUNTARR_SERVICE_NAME}-stripprefix.stripPrefix.prefixes=${HUNTARR_PATH_PREFIX}"
+      - "traefik.http.middlewares.${HUNTARR_SERVICE_NAME}-strip-slash.redirectregex.regex=(^.*${HUNTARR_PATH_PREFIX}$$)"
+      - "traefik.http.middlewares.${HUNTARR_SERVICE_NAME}-strip-slash.redirectregex.replacement=$$1/"
+      - "homepage.group=${HUNTARR_HOMEPAGE_GROUP}"
+      - "homepage.name=${HUNTARR_HOMEPAGE_NAME}"
+      - "homepage.icon=${HUNTARR_HOMEPAGE_ICON}"
+      - "homepage.href=${HUNTARR_PATH_PREFIX}"
+      - "homepage.description=${HUNTARR_HOMEPAGE_DESCRIPTION}"
+
+  # Cleanuperr - Download cleanup automation
+  # Automatically removes completed downloads based on rules and seeding requirements 
+  cleanuperr:
+    image: ghcr.io/flmorg/cleanuperr:${CLEANUPERR_VERSION}
+    restart: unless-stopped
+    <<: *mynetwork
+    volumes:
+      - ${DATA_ROOT}:/data
+    environment:
+      - TZ=${TIMEZONE}
+      - DRY_RUN=false
+      - HTTP_MAX_RETRIES=0
+      - HTTP_TIMEOUT=100
+      - HTTP_VALIDATE_CERT=Enabled
+      
+      - LOGGING__LOGLEVEL=Information
+      - LOGGING__FILE__ENABLED=false
+      - LOGGING__FILE__PATH=/var/logs/
+      - LOGGING__ENHANCED=true
+      
+      - SEARCH_ENABLED=true
+      - SEARCH_DELAY=30
+      
+      - TRIGGERS__QUEUECLEANER=0 0/5 * * * ?
+      - QUEUECLEANER__ENABLED=true
+      #- QUEUECLEANER__IGNORED_DOWNLOADS_PATH=/ignored.txt
+      - QUEUECLEANER__RUNSEQUENTIALLY=true
+      
+      - QUEUECLEANER__IMPORT_FAILED_MAX_STRIKES=5
+      - QUEUECLEANER__IMPORT_FAILED_IGNORE_PRIVATE=false
+      - QUEUECLEANER__IMPORT_FAILED_DELETE_PRIVATE=false
+      - QUEUECLEANER__IMPORT_FAILED_IGNORE_PATTERNS__0=title mismatch
+      - QUEUECLEANER__IMPORT_FAILED_IGNORE_PATTERNS__1=manual import required
+      
+      - QUEUECLEANER__STALLED_MAX_STRIKES=5
+      - QUEUECLEANER__STALLED_RESET_STRIKES_ON_PROGRESS=true
+      - QUEUECLEANER__STALLED_IGNORE_PRIVATE=false
+      - QUEUECLEANER__STALLED_DELETE_PRIVATE=false
+      
+      - QUEUECLEANER__SLOW_MAX_STRIKES=5
+      - QUEUECLEANER__SLOW_RESET_STRIKES_ON_PROGRESS=true
+      - QUEUECLEANER__SLOW_IGNORE_PRIVATE=false
+      - QUEUECLEANER__SLOW_DELETE_PRIVATE=false
+      - QUEUECLEANER__SLOW_MIN_SPEED=1MB
+      - QUEUECLEANER__SLOW_MAX_TIME=20
+      - QUEUECLEANER__SLOW_IGNORE_ABOVE_SIZE=60GB
+      
+      - TRIGGERS__CONTENTBLOCKER=0 0/5 * * * ?
+      - CONTENTBLOCKER__ENABLED=true
+      - CONTENTBLOCKER__IGNORED_DOWNLOADS_PATH=/ignored.txt
+      - CONTENTBLOCKER__IGNORE_PRIVATE=false
+      - CONTENTBLOCKER__DELETE_PRIVATE=false
+      
+      - TRIGGERS__DOWNLOADCLEANER=0 0 * * * ?
+      - DOWNLOADCLEANER__ENABLED=true
+      - DOWNLOADCLEANER__IGNORED_DOWNLOADS_PATH=/ignored.txt
+      - DOWNLOADCLEANER__DELETE_PRIVATE=false
+      
+      - DOWNLOADCLEANER__CATEGORIES__0__NAME=tv-sonarr
+      #- DOWNLOADCLEANER__CATEGORIES__0__MAX_RATIO=50
+      - DOWNLOADCLEANER__CATEGORIES__0__MIN_SEED_TIME=240
+      - DOWNLOADCLEANER__CATEGORIES__0__MAX_SEED_TIME=720
+      - DOWNLOADCLEANER__CATEGORIES__1__NAME=radarr
+      #- DOWNLOADCLEANER__CATEGORIES__1__MAX_RATIO=50
+      - DOWNLOADCLEANER__CATEGORIES__1__MIN_SEED_TIME=240
+      - DOWNLOADCLEANER__CATEGORIES__1__MAX_SEED_TIME=2160
+      - DOWNLOADCLEANER__CATEGORIES__2__NAME=cleanuperr-unlinked
+      #- DOWNLOADCLEANER__CATEGORIES__2__MAX_RATIO=30
+      - DOWNLOADCLEANER__CATEGORIES__2__MIN_SEED_TIME=240
+      - DOWNLOADCLEANER__CATEGORIES__2__MAX_SEED_TIME=2160
+      
+      - DOWNLOADCLEANER__UNLINKED_TARGET_CATEGORY=cleanuperr-unlinked
+      - DOWNLOADCLEANER__UNLINKED_USE_TAG=true
+      - DOWNLOADCLEANER__UNLINKED_IGNORED_ROOT_DIR=/data/torrents
+      - DOWNLOADCLEANER__UNLINKED_CATEGORIES__0=tv-sonarr
+      - DOWNLOADCLEANER__UNLINKED_CATEGORIES__1=radarr
+      
+
+      - DOWNLOAD_CLIENT=qBittorrent
+      - QBITTORRENT__URL=http://qbittorrent:5080
+      #- QBITTORRENT__URL_BASE=
+      - QBITTORRENT__USERNAME=${QBITTORRENT_USERNAME}
+      - QBITTORRENT__PASSWORD=${QBITTORRENT_PASSWORD}
+      # OR
+      # - DOWNLOAD_CLIENT=deluge
+      # - DELUGE__URL=http://localhost:8112
+      # - DELUGE__URL_BASE=myCustomPath
+      # - DELUGE__PASSWORD=pass
+      # OR
+      # - DOWNLOAD_CLIENT=transmission
+      # - TRANSMISSION__URL=http://localhost:9091
+      # - TRANSMISSION__URL_BASE=myCustomPath
+      # - TRANSMISSION__USERNAME=user
+      # - TRANSMISSION__PASSWORD=pass
+      
+      - SONARR__ENABLED=true
+      - SONARR__IMPORT_FAILED_MAX_STRIKES=3
+      - SONARR__SEARCHTYPE=Episode
+      - SONARR__BLOCK__TYPE=blacklist
+      - SONARR__BLOCK__PATH=https://raw.githubusercontent.com/flmorg/cleanuperr/refs/heads/main/blacklist
+      - SONARR__INSTANCES__0__URL=http://sonarr:8989
+      - SONARR__INSTANCES__0__APIKEY=${SONARR_API_KEY}
+      
+      - RADARR__ENABLED=true
+      - RADARR__IMPORT_FAILED_MAX_STRIKES=3
+      - RADARR__BLOCK__TYPE=blacklist
+      - RADARR__BLOCK__PATH=https://raw.githubusercontent.com/flmorg/cleanuperr/refs/heads/main/blacklist
+      - RADARR__INSTANCES__0__URL=http://radarr:7878
+      - RADARR__INSTANCES__0__APIKEY=${RADARR_API_KEY}
+      
+      - LIDARR__ENABLED=true
+      - LIDARR__IMPORT_FAILED_MAX_STRIKES=3
+      #- LIDARR__BLOCK__TYPE=blacklist
+      #- LIDARR__BLOCK__PATH=https://example.com/path/to/file.txt
+      - LIDARR__INSTANCES__0__URL=http://lidarr:8686
+      - LIDARR__INSTANCES__0__APIKEY=${LIDARR_API_KEY}
+      
+  #homarr:
+  #  container_name: homarr
+  #  image: ghcr.io/homarr-labs/homarr:latest
+  #  restart: unless-stopped
+  #  volumes:
+  #    - /var/run/docker.sock:/var/run/docker.sock # Optional, only if you want docker integration
+  #    - ./homarr/appdata:/appdata
+  #  environment:
+  #    - SECRET_ENCRYPTION_KEY=f332a4e7f8abee1af0d09457b7a03ba960e73aaec074526a0f057be6d932dfef
+  #  ports:
+  #    - '7575:7575'
+
+
+  # Watchtower - Automatic container updates
+  # Monitors and updates Docker containers when new images are available
+  watchtower:
+    image: ghcr.io/containrrr/watchtower:${WATCHTOWER_VERSION}
+    container_name: watchtower
+    restart: always
+    environment:
+      - WATCHTOWER_CLEANUP=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Autoheal - Container health monitoring
+  # Automatically restarts unhealthy containers
+  autoheal:
+    image: docker.io/willfarrell/autoheal:${AUTOHEAL_VERSION}
+    container_name: autoheal
+    restart: always
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=all
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Configarr - Configuration management for *arr services
+  # Helps manage and sync configurations across Radarr, Sonarr, etc.
+  configarr:
+    image: ghcr.io/raydak-labs/configarr:${CONFIGARR_VERSION}
+    container_name: configarr
+    <<: *mynetwork
+    environment:
+      TZ: ${TIMEZONE}
+    volumes:
+      - ${CONFIG_ROOT:-.}/configarr/config:/app/config
+      - ${CONFIG_ROOT:-.}/configarr/dockerrepos:/app/repos
+      - ${CONFIG_ROOT:-.}/configarr/cfs:/app/cfs
+      - ${CONFIG_ROOT:-.}/configarr/templates:/app/templates
+
+
+  # Glances - System monitoring
+  # Web-based system monitoring tool showing CPU, memory, disk, and network usage
+  glances:
+    image: docker.io/nicolargo/glances:${GLANCES_VERSION}
+    container_name: glances
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/os-release:/etc/os-release:ro
+      # - ${CONFIG_ROOT:-.}/glances.conf:/etc/glances/glances.conf
+    pid: host
+    network_mode: host
+    environment:
+      - TZ=${TIMEZONE}
+      - "GLANCES_OPT=-w"
+    labels:
+      - "traefik.port=${GLANCES_PORT}"
+      - "traefik.http.routers.glances.rule=(Host(`${HOSTNAME}`) && PathPrefix(`/glances`))"
+      - "traefik.http.routers.glances.tls=true"
+      - "traefik.http.routers.glances.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.glances.loadbalancer.server.port=${GLANCES_PORT}"
+
+  # Cloudflare DDNS - Dynamic DNS updater
+  # Updates Cloudflare DNS records with current public IP address
+  cloudflare-ddns:
+    image: docker.io/favonia/cloudflare-ddns:${CLOUDFLARE_DDNS_VERSION}
+    # Choose the appropriate tag based on your need:
+    # - "latest" for the latest stable version (which could become 2.x.y
+    #   in the future and break things)
+    # - "1" for the latest stable version whose major version is 1
+    # - "1.x.y" to pin the specific version 1.x.y
+    network_mode: host
+    # This bypasses network isolation and makes IPv6 easier (optional; see below)
+    restart: always
+    # Restart the updater after reboot
+    user: "1000:1000"
+    # Run the updater with specific user and group IDs (in that order).
+    # You can change the two numbers based on your need.
+    read_only: true
+    # Make the container filesystem read-only (optional but recommended)
+    cap_drop: [all]
+    # Drop all Linux capabilities (optional but recommended)
+    security_opt: [no-new-privileges:true]
+    environment:
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - DOMAINS=${CLOUDFLARE_DDNS_DOMAINS}
+      - PROXIED=${CLOUDFLARE_DDNS_PROXIED}
+
+  # Home Assistant - Home automation platform
+  # Integrates and controls smart home devices
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:${HOMEASSISTANT_VERSION}
+    container_name: homeassistant
+    restart: unless-stopped
+    volumes:
+      - /var/run/dbus:/var/run/dbus:ro
+      - ${CONFIG_ROOT:-.}/homeassistant:/config
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TIMEZONE}
+    ports:
+      - "${HOMEASSISTANT_PORT}:${HOMEASSISTANT_PORT}"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    labels:
+      - "homepage.group=Home Assistant"
+      - "homepage.name=Home Assistant"
+      - "homepage.icon=https://brands.home-assistant.io/homeassistant/icon.png"
+      - "homepage.href=http://${HOSTNAME}:${HOMEASSISTANT_PORT}"
+      - "homepage.description=Home Assistant"
+    network_mode: host
+    privileged: true
+
+  # PostgreSQL - Database server
+  # Provides database storage for various services
+  postgresql:
+    image: docker.io/library/postgres:${POSTGRES_VERSION}
+    container_name: postgresql
+    restart: unless-stopped
+    user: ${PUID}:${PGID}
+    <<: *mynetwork
+    ports:
+      - ${POSTGRES_PORT}:5432
+    environment:
+      - TZ=${TIMEZONE}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - ${DATA_ROOT}/db/postgresql:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      start_period: 20s
+      interval: 30s
+      retries: 5
+      timeout: 5s
+
+  # pgAdmin - PostgreSQL management interface
+  # Web-based administration tool for PostgreSQL
+  pgadmin:
+    image: docker.io/dpage/pgadmin4:${PGADMIN_VERSION}
+    container_name: pgadmin
+    restart: unless-stopped
+    <<: *mynetwork
+    ports:
+      - ${PGADMIN_LISTEN_PORT}:${PGADMIN_LISTEN_PORT}
+    environment:
+      - PGADMIN_LISTEN_PORT=${PGADMIN_LISTEN_PORT}
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD}
+      - SCRIPT_NAME=/pgadmin4
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pgadmin.rule=(Host(`${HOSTNAME}`) && PathPrefix(`/pgadmin4`))"
+      - "traefik.http.routers.pgadmin.tls=true"
+      - "traefik.http.routers.pgadmin.tls.certresolver=${TRAEFIK_TAILSCALE_CERTRESOLVER_NAME}"
+      - "traefik.http.services.pgadmin.loadbalancer.server.port=${PGADMIN_LISTEN_PORT}"
+
+networks:
+  mynetwork:
+    external: true
+
+volumes:
+  pgadmin-data:
+    driver: local
