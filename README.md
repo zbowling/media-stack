@@ -10,6 +10,9 @@ I'm using docker but in theory this should work with any container orchestrator.
 
 This is my setup that works for me. I'm documenting it in the hope in that might help others but no warrenty or support is provided or implied flexibility is provided.
 
+> [!CAUTION] 
+> This setup doesn't include a VPN container yet to route certian traffic through, but adding [Gluetun](https://github.com/qdm12/gluetun) would be trivial.
+
 **Key Features:**
 - 🔒 Designed assuming you are using Tailscale to access internal services (uses Tailscale SSL certificates to access internal services)
 - 🌐 Optional public access for Jellyfin and Jellyseerr with an updated DDNS setup with Cloudflare and LetsEncrypt
@@ -144,16 +147,14 @@ make check-secrets # Verify secrets.env exists
 ├── movies/          # Radarr movie library
 ├── tv/              # Sonarr TV library  
 ├── music/           # Lidarr music library
-└── torrents/        # qBittorrent download directory
-    ├── movies/      # Movie downloads
-    ├── tv/          # TV downloads
-    └── music/       # Music downloads
+...
+/mnt/torrents/        # qBittorrent download directory
 ```
 
 ## 🔧 Customization
 
 ### Adding VPN Support
-This setup doesn't include a VPN container yet, but adding [Gluetun](https://github.com/qdm12/gluetun) would be trivial:
+
 
 1. Add Gluetun service to docker-compose.yml
 2. Route torrent traffic through the VPN container
@@ -198,16 +199,17 @@ Most *arr applications generate API keys on first startup. Check their web inter
 ## 📝 Notes
 
 - This is my personal setup optimized for my use case
-- No VPN is included by default (but easy to add)
-- Tailscale provides secure remote access without opening ports
+- No VPN is included by default in this setup to tunnel traffic through, but adding [Gluetun](https://github.com/qdm12/gluetun) would be trivial. 
+- Tailscale provides secure remote access without opening ports and it's what I use to access my services.
 - Public access is optional and only recommended for Jellyfin/Jellyseerr
-- All data persists in Docker volumes and your configured media directories
 
 ## 🤝 Contributing
 
-Feel free to open issues or submit PRs if you find improvements or have suggestions!
+Feel free to open issues or submit PRs if you find improvements or have suggestions! There are many other media stack examples out there on github but this is just mine.
 
 ## ⚖️ License
+
+MIT License
 
 This project is provided as-is for educational and personal use. Please ensure you comply with all applicable laws and service terms when using this setup.
 
